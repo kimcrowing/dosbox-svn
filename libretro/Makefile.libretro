@@ -1,0 +1,349 @@
+DEBUG := 0
+
+# Build and link our own sdl and sdl_net statically.
+BUNDLED_SDL ?= 0
+
+GIT_VERSION := " $(shell git rev-parse --short HEAD)"
+SVN_VERSION := " $(shell cat svn)"
+
+UNAME=$(shell uname -s)
+UNAMEM=$(shell uname -m)
+NUMPROC?=$(shell nproc 2>/dev/null)
+ifeq ($(NUMPROC),)
+	NUMPROC=2
+endif
+
+# Target triplet for cross compilation. When cross compiling from Linux to
+# Windows 32-bit using MXE for example, you'd set this to something like:
+#
+#     $ make TARGET_TRIPLET=i686-w64-mingw32.static [...]
+#
+# Or whatever your wanted target is.
+ifdef TARGET_TRIPLET
+	cross_prefix = $(TARGET_TRIPLET)-
+endif
+AR:=$(cross_prefix)$(AR)
+AS:=$(cross_prefix)$(AS)
+CC:=$(cross_prefix)$(CC)
+CXX:=$(cross_prefix)$(CXX)
+LD:=$(cross_prefix)$(LD)
+PKGCONFIG=$(cross_prefix)pkg-config
+
+platform ?= unix
+ifneq ($(findstring MINGW,$(UNAME)),)
+	platform = win
+else ifneq ($(findstring Darwin,$(UNAME)),)
+	platform = osx
+else ifneq ($(findstring win,$(UNAME)),)
+	platform = win
+endif
+
+LIBRETRO_DIR := libretro
+TARGET_NAME  := dosbox_svn
+
+# enable IPX
+ifeq ($(platform),win)
+	WITH_IPX := 1
+else ifeq ($(platform),unix)
+	WITH_IPX := 1
+else ifeq ($(platform),osx)
+	WITH_IPX := 1
+endif
+
+# arm
+ifeq ($(CORTEX_A7), 1)
+	COMMONFLAGS += -marm -mcpu=cortex-a7
+	WITH_DYNAREC = arm
+	ifeq ($(ARM_NEON), 1)
+		COMMONFLAGS += -mfpu=neon-vfpv4
+	endif
+endif
+ifeq ($(ARM_HARDFLOAT), 1)
+	COMMONFLAGS += -mfloat-abi=hard
+endif
+
+# flags
+ifeq ($(platform), osx)
+	COMMONFLAGS += -DC_HAVE_MPROTECT="1"
+	TARGET := $(TARGET_NAME)_libretro.dylib
+	LDFLAGS += -dynamiclib `$(PKGCONFIG) $(PKG_CONFIG_FLAGS) --libs SDL_net`
+	fpic = -fPIC
+	ifndef ($(UNIVERSAL))
+		CFLAGS += $(ARCHFLAGS)
+		CXXFLAGS += $(ARCHFLAGS)
+		LDFLAGS += $(ARCHFLAGS)
+	endif
+else ifneq (,$(findstring ios,$(platform)))
+	TARGET := $(TARGET_NAME)_libretro_ios.dylib
+	COMMONFLAGS += -DHAVE_POSIX_MEMALIGN=1 -marm
+	fpic = -fPIC
+	LDFLAGS += -dynamiclib
+	ifeq ($(IOSSDK),)
+		IOSSDK := $(shell xcodebuild -version -sdk iphoneos Path)
+	endif
+	ifeq ($(platform),ios-arm64)
+		CC = cc -arch arm64 -isysroot $(IOSSDK)
+		CXX = c++ -arch arm64 -isysroot $(IOSSDK)
+	else
+		CC = cc -arch armv7 -isysroot $(IOSSDK)
+		CXX = c++ -arch armv7 -isysroot $(IOSSDK)
+	endif
+	COMMONFLAGS += -DIOS
+	ifeq ($(platform),$(filter $(platform),ios9 ios-arm64))
+		CC += -miphoneos-version-min=8.0
+		COMMONFLAGS += -miphoneos-version-min=8.0
+	else
+		CC += -miphoneos-version-min=5.0
+		COMMONFLAGS += -miphoneos-version-min=5.0
+	endif
+else ifeq ($(platform), psp1)
+	TARGET := $(TARGET_NAME)_libretro_$(platform).a
+	CC = psp-gcc$(EXE_EXT)
+	CXX = psp-g++$(EXE_EXT)
+	AR = psp-ar$(EXE_EXT)
+	WITH_FAKE_SDL = 1
+	COMMONFLAGS += -DPSP -G0 -DWITH_FAKE_SDL -I$(shell psp-config --pspsdk-path)/include -DRENDER_USE_ADVANCED_SCALERS=0
+	STATIC_LINKING = 1
+else ifeq ($(platform), vita)
+	TARGET := $(TARGET_NAME)_libretro_$(platform).a
+	CC = arm-vita-eabi-gcc$(EXE_EXT)
+	CXX = arm-vita-eabi-g++$(EXE_EXT)
+	AR = arm-vita-eabi-ar$(EXE_EXT)
+	WITH_FAKE_SDL = 1
+	COMMONFLAGS += -DVITA -DWITH_FAKE_SDL
+	COMMONFLAGS += -mthumb -mcpu=cortex-a9 -mfloat-abi=hard -ftree-vectorize -ffast-math -fsingle-precision-constant -funroll-loops
+	COMMONFLAGS += -mword-relocations
+	COMMONFLAGS += -fno-optimize-sibling-calls
+	STATIC_LINKING = 1
+else ifeq ($(platform), ctr)
+	TARGET := $(TARGET_NAME)_libretro_$(platform).a
+	CC = $(DEVKITARM)/bin/arm-none-eabi-gcc$(EXE_EXT)
+	CXX = $(DEVKITARM)/bin/arm-none-eabi-g++$(EXE_EXT)
+	AR = $(DEVKITARM)/bin/arm-none-eabi-ar$(EXE_EXT)
+	ENDIANNESS_DEFINES :=
+	WITH_FAKE_SDL = 1
+	COMMONFLAGS += -DARM11 -D_3DS -Os -s -I$(CTRULIB)/include/
+	COMMONFLAGS += -DHAVE_MKDIR
+	COMMONFLAGS += -march=armv6k -mtune=mpcore -mfloat-abi=hard
+	COMMONFLAGS += -mword-relocations
+	COMMONFLAGS += -fomit-frame-pointer -fstrict-aliasing -ffast-math
+	COMMONFLAGS += -DDISABLE_EXCEPTIONS -DWITH_FAKE_SDL -fpermissive
+	COMMONFLAGS += -I$(DEVKITPRO)/libctru/include
+	STATIC_LINKING = 1
+else ifeq ($(platform), ngc)
+	TARGET := $(TARGET_NAME)_libretro_$(platform).a
+	CC = $(DEVKITPPC)/bin/powerpc-eabi-gcc$(EXE_EXT)
+	CXX = $(DEVKITPPC)/bin/powerpc-eabi-g++$(EXE_EXT)
+	AR = $(DEVKITPPC)/bin/powerpc-eabi-ar$(EXE_EXT)
+	WITH_FAKE_SDL = 1
+	COMMONFLAGS += -DGEKKO -DHW_DOL -mrvl -mcpu=750 -meabi -mhard-float -DWITH_FAKE_SDL -D__POWERPC__ -D__ppc__ -DMSB_FIRST -DWORDS_BIGENDIAN=1
+	STATIC_LINKING = 1
+else ifeq ($(platform), wii)
+	TARGET := $(TARGET_NAME)_libretro_$(platform).a
+	CC = $(DEVKITPPC)/bin/powerpc-eabi-gcc$(EXE_EXT)
+	CXX = $(DEVKITPPC)/bin/powerpc-eabi-g++$(EXE_EXT)
+	AR = $(DEVKITPPC)/bin/powerpc-eabi-ar$(EXE_EXT)
+	WITH_FAKE_SDL = 1
+	COMMONFLAGS += -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fpermissive
+	COMMONFLAGS += -U__INT32_TYPE__ -U __UINT32_TYPE__ -D__INT32_TYPE__=int -DWITH_FAKE_SDL -D__POWERPC__ -D__ppc__ -DMSB_FIRST -DWORDS_BIGENDIAN=1
+	STATIC_LINKING = 1
+	WITH_DYNAREC =
+else ifeq ($(platform), wiiu)
+	TARGET := $(TARGET_NAME)_libretro_$(platform).a
+	CC = $(DEVKITPPC)/bin/powerpc-eabi-gcc$(EXE_EXT)
+	CXX = $(DEVKITPPC)/bin/powerpc-eabi-g++$(EXE_EXT)
+	AR = $(DEVKITPPC)/bin/powerpc-eabi-ar$(EXE_EXT)
+	WITH_FAKE_SDL = 1
+	COMMONFLAGS += -DGEKKO -DWIIU -DHW_RVL -mcpu=750 -meabi -mhard-float -I./deps/include/
+	COMMONFLAGS += -U__INT32_TYPE__ -U __UINT32_TYPE__ -D__INT32_TYPE__=int -DWITH_FAKE_SDL -D__POWERPC__ -D__ppc__ -DMSB_FIRST -DWORDS_BIGENDIAN=1
+	STATIC_LINKING = 1
+else ifeq ($(platform), libnx)
+	export DEPSDIR = $(CURDIR)
+	include $(DEVKITPRO)/libnx/switch_rules
+	TARGET := $(TARGET_NAME)_libretro_$(platform).a
+	CFLAGS += -g -O2 -fPIE -I$(LIBNX)/include/ -ffunction-sections -fdata-sections -ftls-model=local-exec -Wl,--allow-multiple-definition -specs=$(LIBNX)/switch.specs
+	CFLAGS += $(INCLUDE) -D__SWITCH__ -DHAVE_LIBNX
+	CXXFLAGS += $(ASFLAGS) $(CFLAGS) -std=gnu++11
+	STATIC_LINKING = 1
+	WITH_FAKE_SDL = 1
+	COMMONFLAGS += -DWITH_FAKE_SDL
+else ifeq ($(platform), emscripten)
+	TARGET := $(TARGET_NAME)_libretro_$(platform).bc
+	STATIC_LINKING = 1
+	LDFLAGS += -Wl,-Bstatic
+	WITH_FAKE_SDL = 1
+	COMMONFLAGS += -DEMSCRIPTEN -DWITH_FAKE_SDL
+else ifeq ($(platform), xbox1_msvc2003)
+	CFLAGS += -D__WIN32__
+	CXXFLAGS += -D__WIN32__
+	TARGET := $(TARGET_NAME)_libretro_xdk1.lib
+	MSVCBINDIRPREFIX = $(XDK)/xbox/bin/vc71
+	CC  = "$(MSVCBINDIRPREFIX)/CL.exe"
+	CXX  = "$(MSVCBINDIRPREFIX)/CL.exe"
+	LD   = "$(MSVCBINDIRPREFIX)/lib.exe"
+	export INCLUDE := $(XDK)/xbox/include
+	export LIB := $(XDK)/xbox/lib
+	PSS_STYLE :=2
+	CFLAGS   += -D_XBOX -D_XBOX1
+	CXXFLAGS += -D_XBOX -D_XBOX1
+	WITH_FAKE_SDL = 1
+	COMMONFLAGS += -DWITH_FAKE_SDL
+	STATIC_LINKING=1
+	HAS_GCC := 0
+else ifeq ($(platform), win)
+	COMMONFLAGS += -mno-ms-bitfields
+	TARGET := $(TARGET_NAME)_libretro.dll
+	LDFLAGS += -shared -static-libgcc -static-libstdc++ -Wl,--version-script=link.T -lwinmm
+	ifeq ($(WITH_FAKE_SDL), 1)
+		COMMONFLAGS += -DWITH_FAKE_SDL
+		LDFLAGS += -Wl,-Bstatic
+	else
+		LDFLAGS += -Wl,-Bstatic `$(cross_prefix)sdl-config --static-libs` -lSDL_net
+		LDFLAGS += -Wl,-Bdynamic -liphlpapi -lws2_32
+	endif
+	COMMONFLAGS += -D__USE_W32_SOCKETS -Werror=return-type
+else ifneq (,$(findstring qnx,$(platform)))
+	TARGET := $(TARGET_NAME)_libretro_qnx.so
+   CXXFLAGS += -D__STDC_LIMIT_MACROS
+   SHARED := -shared -Wl,--version-script=$(CORE_DIR)/link.T -Wl,--no-undefined
+
+	COMMONFLAGS += -DC_HAVE_MPROTECT="1"
+	LDFLAGS += -shared -Wl,--version-script=link.T
+	WITH_FAKE_SDL=1
+	COMMONFLAGS += -DWITH_FAKE_SDL
+	LDFLAGS += -Wl,-Bstatic
+	LDFLAGS += -Wl,-Bdynamic
+	fpic = -fPIC
+	CC = qcc -Vgcc_ntoarmv7le
+	CXX = QCC -Vgcc_ntoarmv7le
+else
+	COMMONFLAGS += -DC_HAVE_MPROTECT="1"
+	TARGET := $(TARGET_NAME)_libretro.so
+	LDFLAGS += -shared -Wl,--version-script=link.T
+	ifeq ($(WITH_FAKE_SDL), 1)
+		COMMONFLAGS += -DWITH_FAKE_SDL
+		LDFLAGS += -Wl,-Bstatic
+	else
+        LDFLAGS += `$(PKGCONFIG) --libs SDL_net`
+	endif
+	LDFLAGS += -Wl,-Bdynamic
+	fpic = -fPIC
+endif
+ifeq ($(DEBUG), 1)
+	COMMONFLAGS += -O0 -g
+else
+	COMMONFLAGS += -O3 -DNDEBUG -DGIT_VERSION=\"$(GIT_VERSION)\" -DSVN_VERSION=\"$(SVN_VERSION)\"
+endif
+
+ifneq ($(WITH_FAKE_SDL), 1)
+	COMMONFLAGS += `$(PKGCONFIG) --cflags sdl`
+	ifeq ($(WITH_IPX), 1)
+		COMMONFLAGS += -DC_IPX
+	endif
+endif
+
+CORE_DIR	:= ..
+INCFLAGS	:=
+SOURCES_C   :=
+SOURCES_CXX :=
+
+DEPS_BIN_DIR = $(CURDIR)/deps_bin
+ifeq ($(BUNDLED_SDL), 1)
+	SDL_BUILD_DIR = $(DEPS_BIN_DIR)/sdl_build
+	SDL = $(DEPS_BIN_DIR)/lib/pkgconfig/sdl.pc
+	SDLNET_BUILD_DIR = $(DEPS_BIN_DIR)/sdl_net_build
+	SDLNET = $(DEPS_BIN_DIR)/lib/pkgconfig/SDL_net.pc
+endif
+
+export PKG_CONFIG_PATH := $(DEPS_BIN_DIR)/lib/pkgconfig:$(PKG_CONFIG_PATH)
+export PATH := $(DEPS_BIN_DIR)/bin:$(PATH)
+# When cross compiling with MXE, we need PKG_CONFIG_PATH_<TARGET_TRIPLET> but with all dashes and
+# dots converted to underscores.
+ifdef TARGET_TRIPLET
+	export PKG_CONFIG_PATH_$(subst .,_,$(subst -,_,$(TARGET_TRIPLET))) = $(PKG_CONFIG_PATH)
+endif
+
+include Makefile.common
+
+OBJECTS = $(SOURCES_CXX:.cpp=.o) $(SOURCES_C:.c=.o)
+OBJECT_DEPS = $(OBJECTS:.o=.d)
+CXXFLAGS += -D__LIBRETRO__ -MMD $(fpic) $(INCFLAGS) $(COMMONFLAGS)
+CFLAGS += -D__LIBRETRO__ -MMD $(fpic) $(INCFLAGS) $(COMMONFLAGS)
+LDFLAGS += -lm $(fpic)
+
+.PHONY: all
+all: $(TARGET)
+
+.PHONY: sdl
+sdl: $(SDL)
+
+.PHONY: sdl_net
+sdl_net: $(SDLNET)
+
+.PHONY: deps
+deps: sdl sdl_net
+
+$(SDL):
+	mkdir -p "$(SDL_BUILD_DIR)"
+	cd "$(SDL_BUILD_DIR)" \
+	&& $(if $(filter $(platform),osx),CC=clang CXX=clang++) CFLAGS= CXXFLAGS= LDFLAGS= \
+	    "$(CURDIR)/deps/sdl/configure" \
+	    --host=$(TARGET_TRIPLET) \
+	    --prefix="$(DEPS_BIN_DIR)" \
+	    --disable-shared \
+	    --enable-static \
+	    --disable-audio \
+	    --disable-video \
+	    --disable-events \
+	    --disable-joystick \
+	    --enable-cdrom \
+	    --enable-threads \
+	    --enable-timers \
+	    --enable-file \
+	    --disable-loadso \
+	    --enable-cpuinfo \
+	    --enable-assembly \
+	    --disable-nasm \
+	    --disable-altivec \
+	    --disable-stdio-redirect \
+	    --disable-rpath \
+	    --with-pic \
+	    --without-x \
+	&& $(MAKE) -j$(NUMPROC) install
+
+$(SDLNET): $(SDL)
+	mkdir -p "$(SDLNET_BUILD_DIR)"
+	cd "$(SDLNET_BUILD_DIR)" \
+	&& $(if $(filter $(platform),osx),CC=clang CXX=clang++) CFLAGS= CXXFLAGS= LDFLAGS= \
+	    "$(CURDIR)/deps/sdl_net/configure" \
+	    --host=$(TARGET_TRIPLET) \
+	    --prefix="$(DEPS_BIN_DIR)" \
+	    --disable-shared \
+	    --enable-static \
+	    --disable-sdltest \
+	    --disable-gui \
+	    --with-pic \
+	&& sed -i'.original' 's/^PROGRAMS =.*/PROGRAMS = /g' Makefile \
+	&& $(MAKE) -j$(NUMPROC) install
+
+$(OBJECTS): $(SDLNET)
+
+$(TARGET): $(OBJECTS)
+ifeq ($(STATIC_LINKING), 1)
+	$(AR) rcs $@ $^
+else
+	$(CXX) -o $@ $^ $(LDFLAGS)
+endif
+
+-include $(OBJECT_DEPS)
+
+.PHONY: targetclean
+targetclean:
+	rm -f $(OBJECTS) $(OBJECT_DEPS) $(TARGET)
+
+.PHONY: depsclean
+depsclean:
+	rm -rf "$(DEPS_BIN_DIR)"
+
+.PHONY: clean
+clean: depsclean targetclean
